@@ -81,7 +81,7 @@ func (s *Snapshot) Range(series string, start, end int64) []Observation {
 	var result []Observation
 	for _, records := range s.state.versions {
 		record, ok := visibleAt(records, s.version)
-		if !ok || record.Series != series || record.Timestamp < start || record.Timestamp >= end {
+		if !ok || record.Kind != recordKindObservation || record.Series != series || record.Timestamp < start || record.Timestamp >= end {
 			continue
 		}
 		result = append(result, Observation{

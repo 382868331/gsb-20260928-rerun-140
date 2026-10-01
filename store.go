@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"sync"
 )
 
@@ -17,12 +18,18 @@ type Observation struct {
 
 // Record is one immutable version of an observation.
 type Record struct {
-	Key       string
-	Series    string
-	Timestamp int64
-	Value     []byte
-	Version   uint64
-	Deleted   bool
+	Key            string
+	Series         string
+	Timestamp      int64
+	Value          []byte
+	Version        uint64
+	Deleted        bool
+	Kind           byte
+	BucketStart    int64
+	BucketWidth    int64
+	Aggregator     string
+	AggregateValue float64
+	SourceVersion  uint64
 }
 
 type observationKey struct {
@@ -228,48 +235,174 @@ func (s *Store) Revise(observation Observation) (uint64, error) {
 func (s *Store) DeleteBefore(before int64) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	next := s.state.clone()
-	var toDelete []Record
+	var rawTombstones []Record
 	for key, records := range s.state.versions {
 		if len(records) == 0 {
 			continue
 		}
 		latest := records[len(records)-1]
-		if latest.Deleted || latest.Timestamp >= before {
+		if latest.Kind != recordKindObservation || latest.Deleted || latest.Timestamp >= before {
 			continue
 		}
 		record := Record{
 			Key:       key,
 			Series:    latest.Series,
 			Timestamp: latest.Timestamp,
-			Version:   next.version + uint64(len(toDelete)) + 1,
+			Kind:      recordKindObservation,
 			Deleted:   true,
 		}
-		next.versions[key] = append(append([]Record(nil), records...), record)
-		next.version = record.Version
-		toDelete = append(toDelete, record)
+		rawTombstones = append(rawTombstones, record)
 	}
-	if len(toDelete) == 0 {
+	if len(rawTombstones) == 0 {
 		return s.state.version, nil
 	}
-	sort.Slice(toDelete, func(i, j int) bool { return toDelete[i].Version < toDelete[j].Version })
-	if err := s.wal.appendBatch(toDelete); err != nil {
+	sort.Slice(rawTombstones, func(i, j int) bool {
+		if rawTombstones[i].Series != rawTombstones[j].Series {
+			return rawTombstones[i].Series < rawTombstones[j].Series
+		}
+		return rawTombstones[i].Timestamp < rawTombstones[j].Timestamp
+	})
+
+	// Build the post-deletion view in a cloned state so affected aggregates can
+	// be recomputed from the exact records that remain visible. Raw tombstones
+	// and aggregate revisions share one WAL batch: an interrupted cleanup can
+	// never leave aggregates without the evidence that explains them.
+	next := s.state.clone()
+	var batch []Record
+	version := s.state.version
+	for index, record := range rawTombstones {
+		version = version + uint64(index) + 1
+		record.Version = version
+		next.versions[record.Key] = append(append([]Record(nil), next.versions[record.Key]...), record)
+		batch = append(batch, record)
+	}
+	next.version = version
+
+	aggregateChanges, err := s.affectedAggregateDeletes(next, before, version)
+	if err != nil {
 		return 0, err
 	}
-	s.pending = append(s.pending, toDelete...)
-	s.state = next
+	for _, record := range aggregateChanges {
+		next.version = record.Version
+		next.versions[record.Key] = append(append([]Record(nil), next.versions[record.Key]...), record)
+		batch = append(batch, record)
+	}
+	if err := s.commitBatch(batch); err != nil {
+		return 0, err
+	}
 	return s.state.version, nil
 }
 
+func (s *Store) affectedAggregateDeletes(state *immutableState, before int64, version uint64) ([]Record, error) {
+	type aggregateIdentity struct {
+		series     string
+		aggregator string
+		width      int64
+		start      int64
+	}
+	affected := map[aggregateIdentity]struct{}{}
+	for _, records := range state.versions {
+		latest := records[len(records)-1]
+		if latest.Kind != recordKindAggregate || latest.Timestamp >= before {
+			continue
+		}
+		affected[aggregateIdentity{latest.Series, latest.Aggregator, latest.BucketWidth, latest.Timestamp}] = struct{}{}
+	}
+
+	identities := make([]aggregateIdentity, 0, len(affected))
+	for identity := range affected {
+		identities = append(identities, identity)
+	}
+	sort.Slice(identities, func(i, j int) bool {
+		if identities[i].series != identities[j].series {
+			return identities[i].series < identities[j].series
+		}
+		if identities[i].aggregator != identities[j].aggregator {
+			return identities[i].aggregator < identities[j].aggregator
+		}
+		if identities[i].width != identities[j].width {
+			return identities[i].width < identities[j].width
+		}
+		return identities[i].start < identities[j].start
+	})
+
+	var changes []Record
+	for _, identity := range identities {
+		key := aggregateKey(identity.series, identity.aggregator, identity.width, identity.start)
+		latest := state.versions[key][len(state.versions[key])-1]
+		if latest.Deleted {
+			continue
+		}
+		var remaining []Record
+		var sourceVersion uint64
+		for _, records := range state.versions {
+			record, visible := visibleAt(records, version)
+			if !visible || record.Kind != recordKindObservation || record.Series != identity.series ||
+				record.Timestamp < identity.start || record.Timestamp >= identity.start+identity.width {
+				continue
+			}
+			remaining = append(remaining, record)
+			if record.Version > sourceVersion {
+				sourceVersion = record.Version
+			}
+		}
+		version = version + 1
+		record := Record{
+			Key:         key,
+			Series:      identity.series,
+			Timestamp:   identity.start,
+			Kind:        recordKindAggregate,
+			BucketStart: identity.start,
+			BucketWidth: identity.width,
+			Aggregator:  identity.aggregator,
+			Version:     version,
+		}
+		if len(remaining) == 0 {
+			record.Kind = recordKindTombstone
+			record.Deleted = true
+		} else {
+			factory, ok := aggregatorFactory(identity.aggregator)
+			if !ok {
+				return nil, ErrUnknownAggregator
+			}
+			aggregation := factory()
+			sort.Slice(remaining, func(i, j int) bool { return remaining[i].Timestamp < remaining[j].Timestamp })
+			for _, remainingRecord := range remaining {
+				if err := aggregation.Add(remainingRecord.Value); err != nil {
+					return nil, err
+				}
+			}
+			value, err := aggregation.Result()
+			if err != nil {
+				return nil, err
+			}
+			record.Value = []byte(strconv.FormatFloat(value, 'g', -1, 64))
+			record.AggregateValue = value
+			record.SourceVersion = sourceVersion
+		}
+		changes = append(changes, record)
+	}
+	return changes, nil
+}
+
 func (s *Store) commit(record Record) error {
+	return s.commitBatch([]Record{record})
+}
+
+func (s *Store) commitBatch(records []Record) error {
+	if len(records) == 0 {
+		return nil
+	}
 	next := s.state.clone()
-	next.version = record.Version
-	next.versions[record.Key] = append(append([]Record(nil), s.state.versions[record.Key]...), record)
-	if err := s.wal.append(record); err != nil {
+	for _, record := range records {
+		next.version = record.Version
+		next.versions[record.Key] = append(append([]Record(nil), s.state.versions[record.Key]...), record)
+	}
+	if err := s.wal.appendBatch(records); err != nil {
 		return err
 	}
 	s.state = next
-	s.pending = append(s.pending, record)
+	s.pending = append(s.pending, records...)
 	return nil
 }
 
@@ -282,8 +415,11 @@ func applyRecords(state *immutableState, records []Record) error {
 			return ErrCorruptStorage
 		}
 		previous, duplicate := seen[record.Version]
-		if duplicate && previous != record.Key {
-			return ErrCorruptStorage
+		if duplicate {
+			if previous != record.Key {
+				return ErrCorruptStorage
+			}
+			continue
 		}
 		if duplicate {
 			continue
