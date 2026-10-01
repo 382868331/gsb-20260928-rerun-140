@@ -11,6 +11,8 @@
 - `DeleteBefore`：写入版本化墓碑，旧快照仍可读，新快照不可见。
 - `Compact`：把 WAL 和历史段合并为不可变段；旧物理文件等待在途快照释放后删除。
 - 重启恢复：已 `Sync` 确认的 WAL、分段和原子清单可恢复；压缩中断后重复版本会去重并完成清理。
+- `RegisterAggregator` / `Downsample`：按固定时间桶生成降采样版本。迟到 `Revise` 只更新受影响桶的新版本，旧快照仍读到原来的原始值与聚合值；空桶也显式产出，重跑与恢复按来源版本跳过，不会重复聚合。
+- `DeleteBefore` 对降采样结果做级联：整桶过期写聚合墓碑，跨 cutoff 的桶用仍存活的点重算；证据只做版本化删除，物理清理仍由 `Compact` 等待在途快照后完成。
 
 ## 示例
 
@@ -29,6 +31,10 @@ snapshot := store.Snapshot()
 defer snapshot.Close()
 rows := snapshot.Range("cpu", 1700000000, 1700003600)
 fmt.Println(version, rows)
+
+store.RegisterAggregator("sum", 60, func(points []Observation) []byte { ... })
+store.Downsample("sum", "cpu", 1700000000, 1700003600)
+buckets := snapshot.Aggregates("sum", "cpu", 1700000000, 1700003600)
 ```
 
 ## 验证

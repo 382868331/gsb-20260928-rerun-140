@@ -81,7 +81,7 @@ func (s *Snapshot) Range(series string, start, end int64) []Observation {
 	var result []Observation
 	for _, records := range s.state.versions {
 		record, ok := visibleAt(records, s.version)
-		if !ok || record.Series != series || record.Timestamp < start || record.Timestamp >= end {
+		if !ok || record.IsAggregate || record.Series != series || record.Timestamp < start || record.Timestamp >= end {
 			continue
 		}
 		result = append(result, Observation{
@@ -91,6 +91,32 @@ func (s *Snapshot) Range(series string, start, end int64) []Observation {
 		})
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Timestamp < result[j].Timestamp })
+	return result
+}
+
+// Aggregates reads downsampled bucket versions visible to the snapshot for the
+// named view. A bucket is returned when its start lies in [start, end); bucket
+// ends stay half-open across boundaries, matching Range.
+func (s *Snapshot) Aggregates(name, series string, start, end int64) []Aggregate {
+	if start > end {
+		return nil
+	}
+	var result []Aggregate
+	for _, records := range s.state.versions {
+		record, ok := visibleAt(records, s.version)
+		if !ok || !record.IsAggregate || record.Name != name || record.Series != series {
+			continue
+		}
+		if record.Timestamp < start || record.Timestamp >= end {
+			continue
+		}
+		result = append(result, Aggregate{
+			Series:      record.Series,
+			BucketStart: record.Timestamp,
+			Value:       append([]byte(nil), record.Value...),
+		})
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].BucketStart < result[j].BucketStart })
 	return result
 }
 

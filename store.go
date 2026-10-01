@@ -23,6 +23,12 @@ type Record struct {
 	Value     []byte
 	Version   uint64
 	Deleted   bool
+	// Aggregate records version a fixed-width downsampling bucket. They share
+	// the MVCC key space with raw observations but use a distinct key prefix.
+	IsAggregate   bool
+	Name          string
+	Width         int64
+	SourceVersion uint64
 }
 
 type observationKey struct {
@@ -32,6 +38,17 @@ type observationKey struct {
 
 func makeKey(series string, timestamp int64) string {
 	return fmt.Sprintf("%s\x00%d", series, timestamp)
+}
+
+func makeAggregateKey(name, series string, bucketStart int64) string {
+	return fmt.Sprintf("\x01agg\x00%s\x00%s\x00%d", name, series, bucketStart)
+}
+
+// registeredAggregator remembers the user callback so expiry can recompute
+// buckets straddling the cutoff without asking the caller again.
+type registeredAggregator struct {
+	width int64
+	fn    func([]Observation) []byte
 }
 
 type immutableState struct {
@@ -73,6 +90,7 @@ type Store struct {
 	deleting    bool
 	waiters     []chan struct{}
 	compactHook func(stage string)
+	aggregators map[string]registeredAggregator
 }
 
 type Options struct {
@@ -147,13 +165,14 @@ func Open(dir string, opts *Options) (*Store, error) {
 		}
 	}
 	return &Store{
-		path:     dir,
-		state:    state,
-		wal:      wal,
-		segments: manifest.Segments,
-		nextSeg:  nextSegment,
-		pending:  append([]Record(nil), walRecords...),
-		refs:     newSnapshotRefs(),
+		path:        dir,
+		state:       state,
+		wal:         wal,
+		segments:    manifest.Segments,
+		nextSeg:     nextSegment,
+		pending:     append([]Record(nil), walRecords...),
+		refs:        newSnapshotRefs(),
+		aggregators: make(map[string]registeredAggregator),
 	}, nil
 }
 
@@ -235,7 +254,7 @@ func (s *Store) DeleteBefore(before int64) (uint64, error) {
 			continue
 		}
 		latest := records[len(records)-1]
-		if latest.Deleted || latest.Timestamp >= before {
+		if latest.IsAggregate || latest.Deleted || latest.Timestamp >= before {
 			continue
 		}
 		record := Record{
@@ -253,23 +272,104 @@ func (s *Store) DeleteBefore(before int64) (uint64, error) {
 		return s.state.version, nil
 	}
 	sort.Slice(toDelete, func(i, j int) bool { return toDelete[i].Version < toDelete[j].Version })
-	if err := s.wal.appendBatch(toDelete); err != nil {
+	cascade, err := s.cascadeAggregationsLocked(next, toDelete, before)
+	if err != nil {
 		return 0, err
 	}
-	s.pending = append(s.pending, toDelete...)
-	s.state = next
+	batch := append(toDelete, cascade...)
+	sort.Slice(batch, func(i, j int) bool { return batch[i].Version < batch[j].Version })
+	if err := s.commitBatch(batch); err != nil {
+		return 0, err
+	}
 	return s.state.version, nil
 }
 
+// cascadeAggregationsLocked keeps downsampled buckets explainable after an
+// expiry: a bucket fully before the cutoff receives a versioned tombstone, and
+// a bucket straddling the cutoff is recomputed from the surviving points. Raw
+// evidence is only made invisible inside the same MVCC version, never removed
+// physically here; compaction waits for in-flight readers.
+func (s *Store) cascadeAggregationsLocked(next *immutableState, rawTombstones []Record, before int64) ([]Record, error) {
+	baseVersion := rawTombstones[len(rawTombstones)-1].Version
+	var cascade []Record
+	for key, records := range next.versions {
+		if len(records) == 0 {
+			continue
+		}
+		latest := records[len(records)-1]
+		if !latest.IsAggregate {
+			continue
+		}
+		bucketEnd := latest.Timestamp + latest.Width
+		if bucketEnd <= before {
+			if latest.Deleted {
+				continue
+			}
+			cascade = append(cascade, Record{
+				Key:           key,
+				Series:        latest.Series,
+				Timestamp:     latest.Timestamp,
+				Version:       baseVersion + uint64(len(cascade)) + 1,
+				Deleted:       true,
+				IsAggregate:   true,
+				Name:          latest.Name,
+				Width:         latest.Width,
+				SourceVersion: next.version,
+			})
+			continue
+		}
+		if latest.Timestamp >= before {
+			continue
+		}
+		aggregator, registered := s.aggregators[latest.Name]
+		if !registered || aggregator.width != latest.Width {
+			// Without the callback we cannot recompute the partial bucket. The
+			// raw evidence stays versioned, so reregistering and running
+			// Downsample later still reconstructs the answer.
+			continue
+		}
+		points, sourceVersion := bucketInputs(next, latest.Series, latest.Timestamp, bucketEnd, next.version)
+		if sourceVersion == latest.SourceVersion {
+			continue
+		}
+		value := aggregator.fn(points)
+		cascade = append(cascade, Record{
+			Key:           key,
+			Series:        latest.Series,
+			Timestamp:     latest.Timestamp,
+			Value:         append([]byte(nil), value...),
+			Version:       baseVersion + uint64(len(cascade)) + 1,
+			IsAggregate:   true,
+			Name:          latest.Name,
+			Width:         latest.Width,
+			SourceVersion: sourceVersion,
+		})
+	}
+	for i := range cascade {
+		next.version = cascade[i].Version
+		next.versions[cascade[i].Key] = append(
+			append([]Record(nil), next.versions[cascade[i].Key]...), cascade[i])
+	}
+	return cascade, nil
+}
+
 func (s *Store) commit(record Record) error {
+	return s.commitBatch([]Record{record})
+}
+
+// commitBatch applies a contiguous set of records already assigned consecutive
+// versions under the store lock and makes them durable as one WAL batch.
+func (s *Store) commitBatch(records []Record) error {
 	next := s.state.clone()
-	next.version = record.Version
-	next.versions[record.Key] = append(append([]Record(nil), s.state.versions[record.Key]...), record)
-	if err := s.wal.append(record); err != nil {
+	for _, record := range records {
+		next.version = record.Version
+		next.versions[record.Key] = append(append([]Record(nil), s.state.versions[record.Key]...), record)
+	}
+	if err := s.wal.appendBatch(records); err != nil {
 		return err
 	}
 	s.state = next
-	s.pending = append(s.pending, record)
+	s.pending = append(s.pending, records...)
 	return nil
 }
 
@@ -304,4 +404,14 @@ func (s *Store) Range(series string, start, end int64) ([]Observation, uint64, e
 	snapshot := s.Snapshot()
 	defer snapshot.Close()
 	return snapshot.Range(series, start, end), snapshot.Version(), nil
+}
+
+// Aggregates returns currently visible downsampled buckets for the named view.
+func (s *Store) Aggregates(name, series string, start, end int64) ([]Aggregate, uint64, error) {
+	if start > end {
+		return nil, 0, ErrInvalidRange
+	}
+	snapshot := s.Snapshot()
+	defer snapshot.Close()
+	return snapshot.Aggregates(name, series, start, end), snapshot.Version(), nil
 }

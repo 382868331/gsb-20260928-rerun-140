@@ -8,11 +8,19 @@ import (
 )
 
 func encodeRecord(record Record) []byte {
+	// flags byte uses bit 0 for tombstones. When bit 1 is set the record is an
+	// aggregate version and carries name/width/source-version trailing fields.
 	size := 1 + 8 + 8 + 4 + len(record.Key) + 4 + len(record.Series) + 4 + len(record.Value)
+	if record.IsAggregate {
+		size += 4 + len(record.Name) + 8 + 8
+	}
 	buf := make([]byte, size)
 	pos := 1
 	if record.Deleted {
 		buf[0] = 1
+	}
+	if record.IsAggregate {
+		buf[0] |= 2
 	}
 	binary.LittleEndian.PutUint64(buf[pos:], record.Version)
 	pos += 8
@@ -26,6 +34,13 @@ func encodeRecord(record Record) []byte {
 	putBytes([]byte(record.Key))
 	putBytes([]byte(record.Series))
 	putBytes(record.Value)
+	if record.IsAggregate {
+		putBytes([]byte(record.Name))
+		binary.LittleEndian.PutUint64(buf[pos:], uint64(record.Width))
+		pos += 8
+		binary.LittleEndian.PutUint64(buf[pos:], record.SourceVersion)
+		pos += 8
+	}
 	return buf
 }
 
@@ -34,6 +49,8 @@ func decodeRecord(buf []byte) (Record, error) {
 		return Record{}, ErrCorruptStorage
 	}
 	record := Record{Deleted: buf[0] == 1}
+	record.IsAggregate = buf[0]&2 != 0
+	record.Deleted = buf[0]&1 != 0
 	pos := 9
 	record.Version = binary.LittleEndian.Uint64(buf[1:9])
 	record.Timestamp = int64(binary.LittleEndian.Uint64(buf[9:17]))
@@ -63,6 +80,20 @@ func decodeRecord(buf []byte) (Record, error) {
 	record.Series = string(data)
 	if record.Value, err = getBytes(); err != nil {
 		return Record{}, err
+	}
+	if record.IsAggregate {
+		var name []byte
+		if name, err = getBytes(); err != nil {
+			return Record{}, err
+		}
+		record.Name = string(name)
+		if pos+16 > len(buf) {
+			return Record{}, ErrCorruptStorage
+		}
+		record.Width = int64(binary.LittleEndian.Uint64(buf[pos:]))
+		pos += 8
+		record.SourceVersion = binary.LittleEndian.Uint64(buf[pos:])
+		pos += 8
 	}
 	if pos != len(buf) {
 		return Record{}, ErrCorruptStorage
