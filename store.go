@@ -29,6 +29,7 @@ type Record struct {
 	Name          string
 	Width         int64
 	SourceVersion uint64
+	SampleCount   int64
 }
 
 type observationKey struct {
@@ -91,6 +92,7 @@ type Store struct {
 	waiters     []chan struct{}
 	compactHook func(stage string)
 	aggregators map[string]registeredAggregator
+	queryViews  map[string]queryViewData
 }
 
 type Options struct {
@@ -164,6 +166,14 @@ func Open(dir string, opts *Options) (*Store, error) {
 			nextSegment = segment.ID + 1
 		}
 	}
+	persistentViews, err := readQueryViewsFile(dir)
+	if err != nil {
+		return nil, err
+	}
+	queryViews := make(map[string]queryViewData, len(persistentViews))
+	for _, view := range persistentViews {
+		queryViews[view.Name] = view
+	}
 	return &Store{
 		path:        dir,
 		state:       state,
@@ -173,6 +183,7 @@ func Open(dir string, opts *Options) (*Store, error) {
 		pending:     append([]Record(nil), walRecords...),
 		refs:        newSnapshotRefs(),
 		aggregators: make(map[string]registeredAggregator),
+		queryViews:  queryViews,
 	}, nil
 }
 
@@ -343,6 +354,7 @@ func (s *Store) cascadeAggregationsLocked(next *immutableState, rawTombstones []
 			Name:          latest.Name,
 			Width:         latest.Width,
 			SourceVersion: sourceVersion,
+			SampleCount:   int64(len(points)),
 		})
 	}
 	for i := range cascade {

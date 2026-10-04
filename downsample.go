@@ -9,9 +9,11 @@ type Aggregator func(points []Observation) []byte
 
 // Aggregate is one versioned value of a downsampling bucket.
 type Aggregate struct {
-	Series      string
-	BucketStart int64
-	Value       []byte
+	Series        string
+	BucketStart   int64
+	Value         []byte
+	SampleCount   int64
+	SourceVersion uint64
 }
 
 // RegisterAggregator binds a name to a bucket width and callback. The callback
@@ -69,6 +71,7 @@ func (s *Store) Downsample(name, series string, start, end int64) (uint64, error
 			Name:          name,
 			Width:         width,
 			SourceVersion: sourceVersion,
+			SampleCount:   int64(len(points)),
 		})
 	}
 	if len(batch) == 0 {

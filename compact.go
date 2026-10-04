@@ -29,7 +29,7 @@ func (s *Store) Compact() (uint64, error) {
 		all = append(all, records...)
 	}
 	all = append(all, pending...)
-	all = mergeRecords(all)
+	all = mergeRecords(all, s.minQueryViewVersionLocked())
 	if err := writeSegmentFile(s.path, segmentID, all); err != nil {
 		s.mu.Unlock()
 		return 0, err
@@ -77,7 +77,17 @@ func (s *Store) Compact() (uint64, error) {
 	return version, nil
 }
 
-func mergeRecords(records []Record) []Record {
+func (s *Store) minQueryViewVersionLocked() uint64 {
+	var minimum uint64
+	for _, view := range s.queryViews {
+		if minimum == 0 || view.Version < minimum {
+			minimum = view.Version
+		}
+	}
+	return minimum
+}
+
+func mergeRecords(records []Record, retainThrough uint64) []Record {
 	byVersion := make(map[uint64]Record)
 	for _, record := range records {
 		if _, exists := byVersion[record.Version]; !exists {
@@ -96,10 +106,15 @@ func mergeRecords(records []Record) []Record {
 	}
 	merged := make([]Record, 0, len(records))
 	for _, history := range byKey {
-		if history[len(history)-1].Deleted {
-			continue
+		for _, record := range history {
+			if record.Version <= retainThrough {
+				merged = append(merged, record)
+			}
 		}
-		merged = append(merged, history...)
+		latest := history[len(history)-1]
+		if latest.Version > retainThrough {
+			merged = append(merged, latest)
+		}
 	}
 	sort.Slice(merged, func(i, j int) bool { return merged[i].Version < merged[j].Version })
 	return merged

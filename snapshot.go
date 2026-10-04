@@ -69,6 +69,15 @@ func (s *Store) Snapshot() *Snapshot {
 	return &Snapshot{state: state, refs: refs, version: state.version}
 }
 
+func (s *Store) snapshotLocked() *Snapshot {
+	return s.snapshotAtLocked(s.state.version)
+}
+
+func (s *Store) snapshotAtLocked(version uint64) *Snapshot {
+	s.refs.add()
+	return &Snapshot{state: s.state, refs: s.refs, version: version}
+}
+
 // Version returns the snapshot's data version.
 func (s *Snapshot) Version() uint64 { return s.version }
 
@@ -111,9 +120,11 @@ func (s *Snapshot) Aggregates(name, series string, start, end int64) []Aggregate
 			continue
 		}
 		result = append(result, Aggregate{
-			Series:      record.Series,
-			BucketStart: record.Timestamp,
-			Value:       append([]byte(nil), record.Value...),
+			Series:        record.Series,
+			BucketStart:   record.Timestamp,
+			Value:         append([]byte(nil), record.Value...),
+			SampleCount:   record.SampleCount,
+			SourceVersion: record.SourceVersion,
 		})
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].BucketStart < result[j].BucketStart })
