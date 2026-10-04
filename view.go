@@ -54,13 +54,43 @@ type QueryView struct {
 }
 
 type QueryBucket struct {
-	Start       int64
-	End         int64
-	Width       int64
-	Aggregator  string
-	Value       []byte
-	SampleCount int64
-	Status      BucketStatus
+	Start         int64
+	End           int64
+	Width         int64
+	Aggregator    string
+	Value         []byte
+	SampleCount   int64
+	SourceVersion uint64
+	Status        BucketStatus
+}
+
+// QueryEntry is one browsable item. A collapsed item represents a run of
+// consecutive raw missing observations; aggregate zero buckets and
+// unmaterialized buckets remain separate entries.
+type QueryEntry struct {
+	Start         int64
+	End           int64
+	Width         int64
+	Aggregator    string
+	Value         []byte
+	SampleCount   int64
+	SourceVersion uint64
+	Status        BucketStatus
+	Collapsed     bool
+	BucketCount   int64
+}
+
+// QueryPage is a fixed-version, cursor-based slice of a query view. Use
+// NextStart as the next read cursor when HasMore is true.
+type QueryPage struct {
+	View      string
+	Series    string
+	Start     int64
+	End       int64
+	Version   uint64
+	Entries   []QueryEntry
+	NextStart int64
+	HasMore   bool
 }
 
 type QuerySegment struct {
@@ -282,44 +312,189 @@ func (v *QueryView) Read() (*QueryResult, error) {
 	}
 	result := &QueryResult{View: v.data.Name, Series: v.data.Series, Start: v.data.Start, End: v.data.End, Version: v.data.Version}
 	for _, tier := range v.data.Tiers {
-		segment := QuerySegment{Start: tier.Start, End: tier.End, Width: tier.Width, Aggregator: tier.Aggregator, Coverage: CoverageComplete}
-		if tier.Aggregator == "" {
-			segment.Buckets = v.rawBuckets(tier.Start, tier.End)
-		} else {
-			buckets, err := v.aggregateBuckets(tier.Aggregator, tier.Start, tier.End, tier.Width)
-			if err != nil {
-				return nil, err
-			}
-			segment.Buckets = buckets
-			for _, bucket := range buckets {
-				if bucket.Status == BucketUnmaterialized {
-					segment.Coverage = CoveragePartial
-					break
-				}
-			}
+		segment, err := v.buildSegment(tier.Start, tier.End, tier)
+		if err != nil {
+			return nil, err
 		}
 		result.Segments = append(result.Segments, segment)
 	}
 	return result, nil
 }
 
-func (v *QueryView) rawBuckets(start, end int64) []QueryBucket {
-	points := v.snap.Range(v.data.Series, start, end)
-	byTime := make(map[int64]Observation, len(points))
-	for _, point := range points {
-		byTime[point.Timestamp] = point
+// ReadWindow expands an arbitrary saved-view window. Aggregate window edges
+// must lie on bucket boundaries; raw windows may use any one-unit boundary.
+func (v *QueryView) ReadWindow(start, end int64) (*QueryResult, error) {
+	if v == nil || v.snap == nil {
+		return nil, ErrQueryViewNotFound
 	}
+	if start < v.data.Start || end > v.data.End || start >= end {
+		return nil, ErrInvalidQueryView
+	}
+	result := &QueryResult{View: v.data.Name, Series: v.data.Series, Start: start, End: end, Version: v.data.Version}
+	for _, tier := range v.data.Tiers {
+		if tier.End <= start || tier.Start >= end {
+			continue
+		}
+		segmentStart := maxInt64(tier.Start, start)
+		segmentEnd := minInt64(tier.End, end)
+		if tier.Aggregator != "" {
+			if bucketFloor(segmentStart, tier.Width) != segmentStart || bucketFloor(segmentEnd, tier.Width) != segmentEnd {
+				return nil, ErrInvalidQueryView
+			}
+		}
+		segment, err := v.buildSegment(segmentStart, segmentEnd, tier)
+		if err != nil {
+			return nil, err
+		}
+		result.Segments = append(result.Segments, segment)
+	}
+	return result, nil
+}
+
+// ReadPage returns at most limit browsable entries beginning at cursor. A
+// limit smaller than one returns an invalid-argument error.
+func (v *QueryView) ReadPage(cursor int64, limit int) (*QueryPage, error) {
+	if v == nil || v.snap == nil {
+		return nil, ErrQueryViewNotFound
+	}
+	if cursor < v.data.Start || cursor >= v.data.End || limit <= 0 {
+		return nil, ErrInvalidQueryView
+	}
+	page := &QueryPage{View: v.data.Name, Series: v.data.Series, Start: cursor, End: v.data.End, Version: v.data.Version}
+	position := cursor
+	for _, tier := range v.data.Tiers {
+		if tier.End <= position {
+			continue
+		}
+		if tier.Start > position || len(page.Entries) >= limit {
+			break
+		}
+		if tier.Aggregator != "" && bucketFloor(position, tier.Width) != position {
+			return nil, ErrInvalidQueryView
+		}
+		var entries []QueryEntry
+		var nextPosition int64
+		var err error
+		if tier.Aggregator == "" {
+			entries, nextPosition, err = v.rawEntries(position, tier.End, limit-len(page.Entries))
+		} else {
+			entries, nextPosition, err = v.aggregateEntries(tier.Aggregator, position, tier.End, tier.Width, limit-len(page.Entries))
+		}
+		if err != nil {
+			return nil, err
+		}
+		page.Entries = append(page.Entries, entries...)
+		position = nextPosition
+		if len(page.Entries) >= limit {
+			break
+		}
+	}
+	page.NextStart = position
+	page.HasMore = position < v.data.End
+	return page, nil
+}
+
+func (v *QueryView) buildSegment(start, end int64, tier ViewTier) (QuerySegment, error) {
+	segment := QuerySegment{Start: start, End: end, Width: tier.Width, Aggregator: tier.Aggregator, Coverage: CoverageComplete}
+	if tier.Aggregator == "" {
+		segment.Buckets = v.rawBuckets(start, end)
+	} else {
+		buckets, err := v.aggregateBuckets(tier.Aggregator, start, end, tier.Width)
+		if err != nil {
+			return QuerySegment{}, err
+		}
+		segment.Buckets = buckets
+		for _, bucket := range buckets {
+			if bucket.Status == BucketUnmaterialized {
+				segment.Coverage = CoveragePartial
+				break
+			}
+		}
+	}
+	return segment, nil
+}
+
+func (v *QueryView) rawBuckets(start, end int64) []QueryBucket {
+	byTime := v.rawRecords(start, end)
 	buckets := make([]QueryBucket, 0)
 	for timestamp := start; timestamp < end; timestamp++ {
 		bucket := QueryBucket{Start: timestamp, End: timestamp + 1, Width: 1, Status: BucketMissingObservation}
-		if point, ok := byTime[timestamp]; ok {
-			bucket.Value = append([]byte(nil), point.Data...)
+		if record, ok := byTime[timestamp]; ok {
+			bucket.Value = append([]byte(nil), record.Value...)
 			bucket.SampleCount = 1
+			bucket.SourceVersion = record.Version
 			bucket.Status = BucketObserved
 		}
 		buckets = append(buckets, bucket)
 	}
 	return buckets
+}
+
+type rawRecord struct {
+	Value   []byte
+	Version uint64
+}
+
+func (v *QueryView) rawRecords(start, end int64) map[int64]rawRecord {
+	records := make(map[int64]rawRecord)
+	for _, versions := range v.snap.state.versions {
+		record, ok := visibleAt(versions, v.snap.version)
+		if !ok || record.IsAggregate || record.Series != v.data.Series || record.Timestamp < start || record.Timestamp >= end {
+			continue
+		}
+		records[record.Timestamp] = rawRecord{Value: append([]byte(nil), record.Value...), Version: record.Version}
+	}
+	return records
+}
+
+func (v *QueryView) rawEntries(start, end int64, limit int) ([]QueryEntry, int64, error) {
+	records := v.rawRecords(start, end)
+	timestamps := make([]int64, 0, len(records))
+	for timestamp := range records {
+		timestamps = append(timestamps, timestamp)
+	}
+	sort.Slice(timestamps, func(i, j int) bool { return timestamps[i] < timestamps[j] })
+	entries := make([]QueryEntry, 0, limit)
+	position := start
+	for _, timestamp := range timestamps {
+		if timestamp > position {
+			entries = append(entries, QueryEntry{Start: position, End: timestamp, Width: 1, Status: BucketMissingObservation, Collapsed: true, BucketCount: timestamp - position})
+			position = timestamp
+			if len(entries) >= limit {
+				return entries, position, nil
+			}
+		}
+		record := records[timestamp]
+		entries = append(entries, QueryEntry{Start: timestamp, End: timestamp + 1, Width: 1, Value: record.Value, SampleCount: 1, SourceVersion: record.Version, Status: BucketObserved, BucketCount: 1})
+		position = timestamp + 1
+		if len(entries) >= limit {
+			return entries, position, nil
+		}
+	}
+	if position < end {
+		entries = append(entries, QueryEntry{Start: position, End: end, Width: 1, Status: BucketMissingObservation, Collapsed: true, BucketCount: end - position})
+		position = end
+	}
+	return entries, position, nil
+}
+
+func (v *QueryView) aggregateEntries(name string, start, end, width int64, limit int) ([]QueryEntry, int64, error) {
+	buckets, err := v.aggregateBuckets(name, start, end, width)
+	if err != nil {
+		return nil, start, err
+	}
+	if len(buckets) > limit {
+		buckets = buckets[:limit]
+	}
+	entries := make([]QueryEntry, 0, len(buckets))
+	for _, bucket := range buckets {
+		entries = append(entries, QueryEntry{Start: bucket.Start, End: bucket.End, Width: bucket.Width, Aggregator: bucket.Aggregator, Value: bucket.Value, SampleCount: bucket.SampleCount, SourceVersion: bucket.SourceVersion, Status: bucket.Status, BucketCount: 1})
+	}
+	nextPosition := end
+	if len(buckets) > 0 {
+		nextPosition = buckets[len(buckets)-1].End
+	}
+	return entries, nextPosition, nil
 }
 
 func (v *QueryView) aggregateBuckets(name string, start, end, width int64) ([]QueryBucket, error) {
@@ -334,6 +509,7 @@ func (v *QueryView) aggregateBuckets(name string, start, end, width int64) ([]Qu
 		if aggregate, ok := byStart[bucketStart]; ok {
 			bucket.Value = append([]byte(nil), aggregate.Value...)
 			bucket.SampleCount = aggregate.SampleCount
+			bucket.SourceVersion = aggregate.SourceVersion
 			legacyCount := aggregate.SampleCount == 0
 			if legacyCount {
 				bucket.SampleCount = v.snap.rawCountAt(aggregate.SourceVersion, v.data.Series, bucketStart, bucketStart+width)
@@ -395,14 +571,16 @@ func (s *Store) DiffQueryViews(fromName, toName string) ([]ChangeRange, error) {
 	for i := range left.Segments {
 		a := left.Segments[i].Buckets
 		b := right.Segments[i].Buckets
+		segmentIntervals := intervals[:0:0]
 		if len(a) != len(b) {
 			return nil, ErrQueryViewMismatch
 		}
 		for j := range a {
 			if a[j].Start != b[j].Start || a[j].Status != b[j].Status || a[j].SampleCount != b[j].SampleCount || !bytesEqual(a[j].Value, b[j].Value) {
-				intervals = appendInterval(intervals, a[j].Start, a[j].End)
+				segmentIntervals = appendInterval(segmentIntervals, a[j].Start, a[j].End)
 			}
 		}
+		intervals = append(intervals, segmentIntervals...)
 	}
 	return intervals, nil
 }
@@ -425,4 +603,18 @@ func appendInterval(intervals []ChangeRange, start, end int64) []ChangeRange {
 		return intervals
 	}
 	return append(intervals, ChangeRange{Start: start, End: end})
+}
+
+func minInt64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }

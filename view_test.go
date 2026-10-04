@@ -87,6 +87,126 @@ func TestQueryViewShowsPartialCoverageForUnmaterializedAggregate(t *testing.T) {
 	}
 }
 
+func TestQueryViewPagesCollapseGapsAndPreserveEntryMetadata(t *testing.T) {
+	store := openTestStore(t)
+	registerTestAverage(t, store)
+	appendAt(t, store, 0, 3)
+	appendAt(t, store, 12, 40)
+	if _, err := store.Downsample("avg", "cpu", 0, 30); err != nil {
+		t.Fatal(err)
+	}
+	view, err := store.CreateQueryView("paged", "cpu", 0, 30, []ViewTier{
+		{Start: 0, End: 10, Width: 1},
+		{Start: 10, End: 20, Width: 10, Aggregator: "avg"},
+		{Start: 20, End: 30, Width: 10, Aggregator: "avg"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer view.Close()
+
+	first, err := view.ReadPage(0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Entries) != 2 || !first.HasMore || first.NextStart != 10 {
+		t.Fatalf("first page = %+v", first)
+	}
+	if first.Entries[0].Status != BucketObserved || first.Entries[0].SampleCount != 1 || first.Entries[0].SourceVersion != 1 {
+		t.Fatalf("observed entry = %+v", first.Entries[0])
+	}
+	if gap := first.Entries[1]; !gap.Collapsed || gap.Start != 1 || gap.End != 10 || gap.BucketCount != 9 || gap.Status != BucketMissingObservation {
+		t.Fatalf("collapsed gap = %+v", gap)
+	}
+
+	second, err := view.ReadPage(first.NextStart, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.Entries) != 2 || second.HasMore || second.NextStart != 30 {
+		t.Fatalf("second page = %+v", second)
+	}
+	if observed := second.Entries[0]; observed.Status != BucketObserved || observed.SampleCount != 1 || observed.SourceVersion != 2 || observed.Width != 10 || observed.Aggregator != "avg" {
+		t.Fatalf("aggregate entry = %+v", observed)
+	}
+	if zero := second.Entries[1]; zero.Status != BucketExplicitZero || zero.Collapsed || zero.SampleCount != 0 || zero.SourceVersion != 0 {
+		t.Fatalf("zero aggregate entry = %+v", zero)
+	}
+}
+
+func TestQueryViewPagesAndWindowsRemainFixedAfterCorrections(t *testing.T) {
+	store := openTestStore(t)
+	registerTestAverage(t, store)
+	appendAt(t, store, 0, 10)
+	appendAt(t, store, 15, 20)
+	if _, err := store.Downsample("avg", "cpu", 0, 30); err != nil {
+		t.Fatal(err)
+	}
+	old, err := store.CreateQueryView("old-paged", "cpu", 0, 30, []ViewTier{
+		{Start: 0, End: 10, Width: 1},
+		{Start: 10, End: 20, Width: 10, Aggregator: "avg"},
+		{Start: 20, End: 30, Width: 10, Aggregator: "avg"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer old.Close()
+
+	if _, err := store.Revise(Observation{Series: "cpu", Timestamp: 0, Data: []byte{30}}); err != nil {
+		t.Fatal(err)
+	}
+	appendAt(t, store, 25, 40)
+	if _, err := store.Downsample("avg", "cpu", 0, 30); err != nil {
+		t.Fatal(err)
+	}
+	newView, err := store.CreateQueryView("new-paged", "cpu", 0, 30, []ViewTier{
+		{Start: 0, End: 10, Width: 1},
+		{Start: 10, End: 20, Width: 10, Aggregator: "avg"},
+		{Start: 20, End: 30, Width: 10, Aggregator: "avg"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newView.Close()
+
+	changes, err := store.DiffQueryViews("old-paged", "new-paged")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantChanges := []ChangeRange{{Start: 0, End: 1}, {Start: 20, End: 30}}
+	if len(changes) != len(wantChanges) {
+		t.Fatalf("changes = %+v, want %+v", changes, wantChanges)
+	}
+	for i := range wantChanges {
+		if changes[i] != wantChanges[i] {
+			t.Fatalf("changes = %+v, want %+v", changes, wantChanges)
+		}
+	}
+
+	page, err := old.ReadPage(0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Version != old.Version() || page.Entries[0].Value[0] != 10 {
+		t.Fatalf("old first page changed: %+v", page)
+	}
+	rest, err := old.ReadPage(page.NextStart, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rest.Entries[1].Status != BucketExplicitZero || rest.HasMore {
+		t.Fatalf("old later page changed: %+v", rest)
+	}
+
+	changedWindow, err := old.ReadWindow(changes[1].Start, changes[1].End)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changedWindow.Version != old.Version() || len(changedWindow.Segments) != 1 || changedWindow.Segments[0].Buckets[0].Status != BucketExplicitZero {
+		t.Fatalf("changed window = %+v", changedWindow)
+	}
+}
+
 func TestSavedQueryViewStableAcrossCorrectionsRestartAndDiff(t *testing.T) {
 	dir := t.TempDir()
 	store, err := Open(dir, &Options{DisableSync: true})

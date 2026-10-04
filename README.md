@@ -14,7 +14,9 @@
 - `RegisterAggregator` / `Downsample`：按固定时间桶生成降采样版本。迟到 `Revise` 只更新受影响桶的新版本，旧快照仍读到原来的原始值与聚合值；空桶也显式产出，重跑与恢复按来源版本跳过，不会重复聚合。
 - `DeleteBefore` 对降采样结果做级联：整桶过期写聚合墓碑，跨 cutoff 的桶用仍存活的点重算；证据只做版本化删除，物理清理仍由 `Compact` 等待在途快照后完成。
 - `CreateQueryView`：保存固定更正版本的跨分辨率查询视图。视图由互不重叠的半开段组成，原始段逐点区分 `missing-observation`，聚合段通过 `explicit-zero` 与 `SampleCount` 区分空桶、零值和不同样本量；`unmaterialized` 表示该桶尚未生成降采样证据。
-- `OpenQueryView` / `CancelQueryView`：保存重开后仍按创建时版本读取；取消前，压缩会保留该视图需要的历史版本，取消并再次压缩后释放。`DiffQueryViews` 返回新旧视图之间具体变化的桶时间范围，跨分辨率边界不重复计数。
+- `ReadPage`：按游标分页浏览，连续原始缺失点折叠成一个条目；观察、真实零值、空聚合桶和未物化汇总保持不同状态。条目包含粒度、聚合器、样本量、来源版本和折叠桶数，同一视图所有页都固定在创建时版本。
+- `ReadWindow`：按需展开变化区间或任意半开时间窗口，返回该窗口内的具体桶和样本信息。
+- `OpenQueryView` / `CancelQueryView`：保存重开后仍按创建时版本读取；取消前，压缩会保留该视图需要的历史版本，取消并关闭在途读取、再次压缩后释放。`DiffQueryViews` 先返回新旧视图之间具体变化的桶时间范围，跨粒度边界不合并，随后可对每个区间调用 `ReadWindow`。
 
 ## 示例
 
@@ -42,8 +44,12 @@ view, err := store.CreateQueryView("daily-detail", "cpu", 1700000000, 1700007200
 	{Start: 1700000000, End: 1700003600, Width: 1},                       // 原始点
 	{Start: 1700003600, End: 1700007200, Width: 60, Aggregator: "sum"}, // 分钟桶
 })
-})
 result, err := view.Read()
+page, err := view.ReadPage(0, 100)
+if page.HasMore {
+	page, err = view.ReadPage(page.NextStart, 100)
+}
+window, err := view.ReadWindow(1700000000, 1700007200)
 changes, err := store.DiffQueryViews("yesterday", "today")
 ```
 
