@@ -12,6 +12,12 @@ type Aggregate struct {
 	Series      string
 	BucketStart int64
 	Value       []byte
+	// Count is the number of raw observations behind the value. It stays zero
+	// for an explicitly evaluated empty bucket, so callers never mistake a
+	// missing observation for a genuinely observed value, even when Value is a
+	// real zero. It also prevents treating means of differently sized samples
+	// as interchangeable when segments are combined.
+	Count int
 }
 
 // RegisterAggregator binds a name to a bucket width and callback. The callback
@@ -68,6 +74,7 @@ func (s *Store) Downsample(name, series string, start, end int64) (uint64, error
 			IsAggregate:   true,
 			Name:          name,
 			Width:         width,
+			Count:         len(points),
 			SourceVersion: sourceVersion,
 		})
 	}

@@ -25,9 +25,13 @@ type Record struct {
 	Deleted   bool
 	// Aggregate records version a fixed-width downsampling bucket. They share
 	// the MVCC key space with raw observations but use a distinct key prefix.
-	IsAggregate   bool
-	Name          string
-	Width         int64
+	IsAggregate bool
+	Name        string
+	Width       int64
+	// Count records how many raw observations fed the aggregate. Zero means
+	// the bucket was evaluated explicitly but contained no observations,
+	// which differs from a real zero produced from present observations.
+	Count         int
 	SourceVersion uint64
 }
 
@@ -314,6 +318,7 @@ func (s *Store) cascadeAggregationsLocked(next *immutableState, rawTombstones []
 				IsAggregate:   true,
 				Name:          latest.Name,
 				Width:         latest.Width,
+				Count:         0,
 				SourceVersion: next.version,
 			})
 			continue
@@ -342,6 +347,7 @@ func (s *Store) cascadeAggregationsLocked(next *immutableState, rawTombstones []
 			IsAggregate:   true,
 			Name:          latest.Name,
 			Width:         latest.Width,
+			Count:         len(points),
 			SourceVersion: sourceVersion,
 		})
 	}

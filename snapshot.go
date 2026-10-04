@@ -69,6 +69,30 @@ func (s *Store) Snapshot() *Snapshot {
 	return &Snapshot{state: state, refs: refs, version: state.version}
 }
 
+// SnapshotAt pins an explicit, already committed data version. Later backfill
+// and corrections only create newer versions, so a delivered query view built
+// on the returned snapshot keeps its original meaning even after new data is
+// appended, downsampled again, or compacted away physically.
+func (s *Store) SnapshotAt(version uint64) (*Snapshot, error) {
+	s.mu.Lock()
+	for s.deleting {
+		waiter := make(chan struct{})
+		s.waiters = append(s.waiters, waiter)
+		s.mu.Unlock()
+		<-waiter
+		s.mu.Lock()
+	}
+	if version == 0 || version > s.state.version {
+		s.mu.Unlock()
+		return nil, ErrInvalidVersion
+	}
+	s.refs.add()
+	state := s.state
+	refs := s.refs
+	s.mu.Unlock()
+	return &Snapshot{state: state, refs: refs, version: version}, nil
+}
+
 // Version returns the snapshot's data version.
 func (s *Snapshot) Version() uint64 { return s.version }
 
@@ -114,6 +138,7 @@ func (s *Snapshot) Aggregates(name, series string, start, end int64) []Aggregate
 			Series:      record.Series,
 			BucketStart: record.Timestamp,
 			Value:       append([]byte(nil), record.Value...),
+			Count:       record.Count,
 		})
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].BucketStart < result[j].BucketStart })

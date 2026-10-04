@@ -10,5 +10,7 @@ var (
 	ErrCorruptStorage          = errors.New("timeseries: corrupt storage")
 	ErrInvalidAggregator       = errors.New("timeseries: invalid aggregator definition")
 	ErrAggregatorNotRegistered = errors.New("timeseries: aggregator not registered")
+	ErrInvalidVersion          = errors.New("timeseries: pinned data version is not available")
+	ErrInvalidTier             = errors.New("timeseries: invalid resolution tier")
 	errHookExit                = errors.New("timeseries: simulated compaction interruption")
 )

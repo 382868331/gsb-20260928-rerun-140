@@ -12,7 +12,7 @@ func encodeRecord(record Record) []byte {
 	// aggregate version and carries name/width/source-version trailing fields.
 	size := 1 + 8 + 8 + 4 + len(record.Key) + 4 + len(record.Series) + 4 + len(record.Value)
 	if record.IsAggregate {
-		size += 4 + len(record.Name) + 8 + 8
+		size += 4 + len(record.Name) + 8 + 8 + 8
 	}
 	buf := make([]byte, size)
 	pos := 1
@@ -39,6 +39,8 @@ func encodeRecord(record Record) []byte {
 		binary.LittleEndian.PutUint64(buf[pos:], uint64(record.Width))
 		pos += 8
 		binary.LittleEndian.PutUint64(buf[pos:], record.SourceVersion)
+		pos += 8
+		binary.LittleEndian.PutUint64(buf[pos:], uint64(record.Count))
 		pos += 8
 	}
 	return buf
@@ -87,12 +89,14 @@ func decodeRecord(buf []byte) (Record, error) {
 			return Record{}, err
 		}
 		record.Name = string(name)
-		if pos+16 > len(buf) {
+		if pos+24 > len(buf) {
 			return Record{}, ErrCorruptStorage
 		}
 		record.Width = int64(binary.LittleEndian.Uint64(buf[pos:]))
 		pos += 8
 		record.SourceVersion = binary.LittleEndian.Uint64(buf[pos:])
+		pos += 8
+		record.Count = int(binary.LittleEndian.Uint64(buf[pos:]))
 		pos += 8
 	}
 	if pos != len(buf) {
