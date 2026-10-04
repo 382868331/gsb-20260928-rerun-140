@@ -86,6 +86,41 @@ type ChangeRange struct {
 	End   int64
 }
 
+// BrowseEntry is one row of a ranged browse. Collapsed rows span Count
+// consecutive buckets that share the same absence status; expanded rows
+// always have Count == 1 and carry the bucket Width and SampleCount.
+type BrowseEntry struct {
+	Start       int64
+	End         int64
+	Width       int64
+	Aggregator  string
+	Status      BucketStatus
+	Value       []byte
+	SampleCount int64
+	Count       int64
+}
+
+// BrowseSegment is the part of one tier that overlaps the browsed window.
+type BrowseSegment struct {
+	Start      int64
+	End        int64
+	Width      int64
+	Aggregator string
+	Coverage   Coverage
+	Entries    []BrowseEntry
+}
+
+// BrowseResult is a windowed read of a view. Version is the view's pinned
+// correction version, identical across every page of the same view.
+type BrowseResult struct {
+	View     string
+	Series   string
+	Start    int64
+	End      int64
+	Version  uint64
+	Segments []BrowseSegment
+}
+
 func viewsFilePath(dir string) string { return filepath.Join(dir, "views.json") }
 
 func readQueryViewsFile(dir string) ([]queryViewData, error) {
@@ -322,6 +357,83 @@ func (v *QueryView) rawBuckets(start, end int64) []QueryBucket {
 	return buckets
 }
 
+// ReadRange browses the window [start, end) of the view at its pinned
+// version. Segments are clipped to the window and still meet at exact tier
+// boundaries. When collapse is true, consecutive buckets that share an
+// absence status (missing-observation or unmaterialized) fold into one
+// entry whose Count records the folded bucket count; observed, explicit-zero
+// and differing-status buckets stay individual so averages with different
+// sample counts are never merged. Every page of the same view reads the
+// same version, so later revisions cannot change already-seen pages; Close
+// releases the pin.
+func (v *QueryView) ReadRange(start, end int64, collapse bool) (*BrowseResult, error) {
+	if v == nil || v.snap == nil {
+		return nil, ErrQueryViewNotFound
+	}
+	if start < v.data.Start || end > v.data.End || start >= end {
+		return nil, ErrInvalidRange
+	}
+	result := &BrowseResult{View: v.data.Name, Series: v.data.Series, Start: start, End: end, Version: v.data.Version}
+	for _, tier := range v.data.Tiers {
+		lo := start
+		if tier.Start > lo {
+			lo = tier.Start
+		}
+		hi := end
+		if tier.End < hi {
+			hi = tier.End
+		}
+		if lo >= hi {
+			continue
+		}
+		segment := BrowseSegment{Start: lo, End: hi, Width: tier.Width, Aggregator: tier.Aggregator, Coverage: CoverageComplete}
+		var buckets []QueryBucket
+		if tier.Aggregator == "" {
+			buckets = v.rawBuckets(lo, hi)
+		} else {
+			alignedLo := lo - (lo-tier.Start)%tier.Width
+			generated, err := v.aggregateBuckets(tier.Aggregator, alignedLo, tier.End, tier.Width)
+			if err != nil {
+				return nil, err
+			}
+			for _, bucket := range generated {
+				if bucket.End > lo && bucket.Start < hi {
+					buckets = append(buckets, bucket)
+				}
+			}
+		}
+		for _, bucket := range buckets {
+			if bucket.Status == BucketUnmaterialized {
+				segment.Coverage = CoveragePartial
+			}
+			segment.Entries = appendBrowseEntry(segment.Entries, bucket, collapse)
+		}
+		result.Segments = append(result.Segments, segment)
+	}
+	return result, nil
+}
+
+func appendBrowseEntry(entries []BrowseEntry, bucket QueryBucket, collapse bool) []BrowseEntry {
+	collapsible := bucket.Status == BucketMissingObservation || bucket.Status == BucketUnmaterialized
+	if collapse && collapsible && len(entries) > 0 {
+		last := &entries[len(entries)-1]
+		if last.Status == bucket.Status && last.End == bucket.Start && last.Width == bucket.Width && last.Aggregator == bucket.Aggregator {
+			last.End = bucket.End
+			last.Count++
+			return entries
+		}
+	}
+	return append(entries, BrowseEntry{
+		Start:       bucket.Start,
+		End:         bucket.End,
+		Width:       bucket.Width,
+		Aggregator:  bucket.Aggregator,
+		Status:      bucket.Status,
+		Value:       bucket.Value,
+		SampleCount: bucket.SampleCount,
+		Count:       1,
+	})
+}
 func (v *QueryView) aggregateBuckets(name string, start, end, width int64) ([]QueryBucket, error) {
 	aggregates := v.snap.Aggregates(name, v.data.Series, start, end)
 	byStart := make(map[int64]Aggregate, len(aggregates))

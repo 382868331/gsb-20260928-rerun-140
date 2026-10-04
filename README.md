@@ -15,6 +15,7 @@
 - `DeleteBefore` 对降采样结果做级联：整桶过期写聚合墓碑，跨 cutoff 的桶用仍存活的点重算；证据只做版本化删除，物理清理仍由 `Compact` 等待在途快照后完成。
 - `CreateQueryView`：保存固定更正版本的跨分辨率查询视图。视图由互不重叠的半开段组成，原始段逐点区分 `missing-observation`，聚合段通过 `explicit-zero` 与 `SampleCount` 区分空桶、零值和不同样本量；`unmaterialized` 表示该桶尚未生成降采样证据。
 - `OpenQueryView` / `CancelQueryView`：保存重开后仍按创建时版本读取；取消前，压缩会保留该视图需要的历史版本，取消并再次压缩后释放。`DiffQueryViews` 返回新旧视图之间具体变化的桶时间范围，跨分辨率边界不重复计数。
+- `QueryView.ReadRange(start, end, collapse)`：按时间窗口浏览视图，段在粒度边界处截断且互不重叠。`collapse=true` 时连续缺失（`missing-observation`）或未生成（`unmaterialized`）的桶折叠为一条带 `Count` 的记录；观察值、真实零值（`explicit-zero`）与不同样本量的平均数保持独立条目。`collapse=false` 展开后每条记录带粒度 `Width`、`SampleCount`，结果携带固定 `Version`：同一视图的每次分页读取版本一致，之后的补录不改变已看过的页；`Close` 释放该视图持有的版本保留。配合 `DiffQueryViews` 先取变化区间，再对具体窗口 `ReadRange` 展开。
 
 ## 示例
 
@@ -45,6 +46,8 @@ view, err := store.CreateQueryView("daily-detail", "cpu", 1700000000, 1700007200
 })
 result, err := view.Read()
 changes, err := store.DiffQueryViews("yesterday", "today")
+page, err := view.ReadRange(1700000000, 1700003600, true) // 折叠连续缺失区间
+detail, err := view.ReadRange(changes[0].Start, changes[0].End, false) // 展开变化窗口
 ```
 
 ## 验证
