@@ -45,12 +45,150 @@ type queryViewsFile struct {
 	Views []queryViewData `json:"views"`
 }
 
+type QueryBookmarkWindow struct {
+	Series  string     `json:"series"`
+	Start   int64      `json:"start"`
+	End     int64      `json:"end"`
+	Version uint64     `json:"version"`
+	Tiers   []ViewTier `json:"tiers"`
+}
+
+type queryBookmarkData struct {
+	Name    string                `json:"name"`
+	Windows []QueryBookmarkWindow `json:"windows"`
+}
+
+type queryBookmarksFile struct {
+	Bookmarks []queryBookmarkData `json:"bookmarks"`
+}
+
+// QueryBookmark is a named, durable group of fixed-version query windows.
+type QueryBookmark struct {
+	store *Store
+	data  queryBookmarkData
+}
+
+type BookmarkWindowComparison struct {
+	Index   int
+	From    QueryBookmarkWindow
+	To      QueryBookmarkWindow
+	Changed bool
+	Changes []ChangeRange
+}
+
+// DiffQueryBookmarks compares windows at the same index. Returned comparisons
+// put changed windows first while preserving their original relative order.
+func (s *Store) DiffQueryBookmarks(fromName, toName string) ([]BookmarkWindowComparison, error) {
+	s.mu.Lock()
+	fromData, ok := s.queryBookmarks[fromName]
+	if !ok {
+		s.mu.Unlock()
+		return nil, ErrQueryBookmarkNotFound
+	}
+	toData, ok := s.queryBookmarks[toName]
+	if !ok {
+		s.mu.Unlock()
+		return nil, ErrQueryBookmarkNotFound
+	}
+	if len(fromData.Windows) != len(toData.Windows) {
+		s.mu.Unlock()
+		return nil, ErrQueryBookmarkMismatch
+	}
+	fromViews := make([]*QueryView, 0, len(fromData.Windows))
+	toViews := make([]*QueryView, 0, len(toData.Windows))
+	closeOpened := func() {
+		for _, view := range fromViews {
+			view.Close()
+		}
+		for _, view := range toViews {
+			view.Close()
+		}
+	}
+	for i := range fromData.Windows {
+		window := fromData.Windows[i]
+		fromView, err := s.openQueryViewDataLocked(queryViewData{Name: fromName, Series: window.Series, Start: window.Start, End: window.End, Version: window.Version, Tiers: append([]ViewTier(nil), window.Tiers...)})
+		if err != nil {
+			closeOpened()
+			s.mu.Unlock()
+			return nil, err
+		}
+		fromViews = append(fromViews, fromView)
+		window = toData.Windows[i]
+		toView, err := s.openQueryViewDataLocked(queryViewData{Name: toName, Series: window.Series, Start: window.Start, End: window.End, Version: window.Version, Tiers: append([]ViewTier(nil), window.Tiers...)})
+		if err != nil {
+			closeOpened()
+			s.mu.Unlock()
+			return nil, err
+		}
+		toViews = append(toViews, toView)
+	}
+	s.mu.Unlock()
+	defer closeOpened()
+
+	var changed []BookmarkWindowComparison
+	var unchanged []BookmarkWindowComparison
+	for i := range fromViews {
+		changes, err := compareQueryViews(fromViews[i], toViews[i])
+		if err != nil {
+			return nil, err
+		}
+		comparison := BookmarkWindowComparison{
+			Index:   i,
+			From:    fromData.Windows[i],
+			To:      toData.Windows[i],
+			Changed: len(changes) > 0,
+			Changes: changes,
+		}
+		if comparison.Changed {
+			changed = append(changed, comparison)
+		} else {
+			unchanged = append(unchanged, comparison)
+		}
+	}
+	return append(changed, unchanged...), nil
+}
+
 // QueryView is a fixed-version, reusable cross-resolution read plan. Saved
 // views remain available after reopening the store.
 type QueryView struct {
 	store *Store
 	snap  *Snapshot
 	data  queryViewData
+}
+
+func bookmarkViewsFilePath(dir string) string { return filepath.Join(dir, "bookmarks.json") }
+
+func readQueryBookmarksFile(dir string) ([]queryBookmarkData, error) {
+	bytes, err := os.ReadFile(bookmarkViewsFilePath(dir))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(bytes) == 0 {
+		return nil, nil
+	}
+	var file queryBookmarksFile
+	if err := json.Unmarshal(bytes, &file); err != nil {
+		return nil, err
+	}
+	return file.Bookmarks, nil
+}
+
+func writeQueryBookmarksFile(dir string, bookmarks []queryBookmarkData) error {
+	data, err := json.MarshalIndent(queryBookmarksFile{Bookmarks: bookmarks}, "", "  ")
+	if err != nil {
+		return err
+	}
+	temporary := bookmarkViewsFilePath(dir) + ".tmp"
+	if err := os.WriteFile(temporary, data, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(temporary, bookmarkViewsFilePath(dir)); err != nil {
+		return err
+	}
+	return syncDir(dir)
 }
 
 type QueryBucket struct {
@@ -226,6 +364,168 @@ func (s *Store) queryViewList() []queryViewData {
 	return views
 }
 
+func (s *Store) queryBookmarkList() []queryBookmarkData {
+	bookmarks := make([]queryBookmarkData, 0, len(s.queryBookmarks))
+	for _, bookmark := range s.queryBookmarks {
+		bookmarks = append(bookmarks, bookmark)
+	}
+	sort.Slice(bookmarks, func(i, j int) bool { return bookmarks[i].Name < bookmarks[j].Name })
+	return bookmarks
+}
+
+func cloneBookmarkWindows(windows []QueryBookmarkWindow) []QueryBookmarkWindow {
+	clone := make([]QueryBookmarkWindow, len(windows))
+	for i, window := range windows {
+		clone[i] = QueryBookmarkWindow{
+			Series:  window.Series,
+			Start:   window.Start,
+			End:     window.End,
+			Version: window.Version,
+			Tiers:   append([]ViewTier(nil), window.Tiers...),
+		}
+	}
+	return clone
+}
+
+func (s *Store) validateBookmarkWindowLocked(window QueryBookmarkWindow) error {
+	if window.Series == "" || window.Version > s.state.version {
+		return ErrInvalidQueryBookmark
+	}
+	return s.validateTiersLocked(window.Series, window.Start, window.End, window.Tiers)
+}
+
+// SaveQueryBookmark saves a named set of windows. A zero Version in each
+// window is recorded as the store's current version.
+func (s *Store) SaveQueryBookmark(name string, windows []QueryBookmarkWindow) (*QueryBookmark, error) {
+	if name == "" || len(windows) == 0 {
+		return nil, ErrInvalidQueryBookmark
+	}
+	copied := cloneBookmarkWindows(windows)
+	s.mu.Lock()
+	if _, exists := s.queryBookmarks[name]; exists {
+		s.mu.Unlock()
+		return nil, ErrQueryBookmarkExists
+	}
+	for i := range copied {
+		if copied[i].Version == 0 {
+			copied[i].Version = s.state.version
+		}
+		if err := s.validateBookmarkWindowLocked(copied[i]); err != nil {
+			s.mu.Unlock()
+			return nil, err
+		}
+	}
+	data := queryBookmarkData{Name: name, Windows: copied}
+	bookmarks := append(s.queryBookmarkList(), data)
+	if err := writeQueryBookmarksFile(s.path, bookmarks); err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
+	s.queryBookmarks[name] = data
+	s.mu.Unlock()
+	return &QueryBookmark{store: s, data: data}, nil
+}
+
+// CreateQueryBookmark groups references to already-saved fixed-version views.
+func (s *Store) CreateQueryBookmark(name string, viewNames []string) (*QueryBookmark, error) {
+	if name == "" || len(viewNames) == 0 {
+		return nil, ErrInvalidQueryBookmark
+	}
+	windows := make([]QueryBookmarkWindow, 0, len(viewNames))
+	s.mu.Lock()
+	for _, viewName := range viewNames {
+		if viewName == "" {
+			s.mu.Unlock()
+			return nil, ErrInvalidQueryBookmark
+		}
+		view, ok := s.queryViews[viewName]
+		if !ok {
+			s.mu.Unlock()
+			return nil, ErrQueryViewNotFound
+		}
+		windows = append(windows, QueryBookmarkWindow{
+			Series:  view.Series,
+			Start:   view.Start,
+			End:     view.End,
+			Version: view.Version,
+			Tiers:   append([]ViewTier(nil), view.Tiers...),
+		})
+	}
+	s.mu.Unlock()
+	return s.SaveQueryBookmark(name, windows)
+}
+
+// CreateQueryBookmarkWithWindows saves an explicit group of window specs.
+func (s *Store) CreateQueryBookmarkWithWindows(name string, windows []QueryBookmarkWindow) (*QueryBookmark, error) {
+	return s.SaveQueryBookmark(name, windows)
+}
+
+// OpenQueryBookmark restores a saved bookmark without pinning snapshots.
+func (s *Store) OpenQueryBookmark(name string) (*QueryBookmark, error) {
+	s.mu.Lock()
+	data, ok := s.queryBookmarks[name]
+	if !ok {
+		s.mu.Unlock()
+		return nil, ErrQueryBookmarkNotFound
+	}
+	for _, window := range data.Windows {
+		if err := s.validateBookmarkWindowLocked(window); err != nil {
+			s.mu.Unlock()
+			return nil, err
+		}
+	}
+	s.mu.Unlock()
+	return &QueryBookmark{store: s, data: data}, nil
+}
+
+// CancelQueryBookmark removes only the bookmark. Windows also belonging to
+// standalone views or another bookmark retain their own retention references.
+func (s *Store) CancelQueryBookmark(name string) error {
+	s.mu.Lock()
+	if _, ok := s.queryBookmarks[name]; !ok {
+		s.mu.Unlock()
+		return ErrQueryBookmarkNotFound
+	}
+	bookmarks := s.queryBookmarkList()
+	filtered := bookmarks[:0]
+	for _, bookmark := range bookmarks {
+		if bookmark.Name != name {
+			filtered = append(filtered, bookmark)
+		}
+	}
+	if err := writeQueryBookmarksFile(s.path, filtered); err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	delete(s.queryBookmarks, name)
+	s.mu.Unlock()
+	return nil
+}
+
+func (b *QueryBookmark) Name() string { return b.data.Name }
+
+func (b *QueryBookmark) Windows() []QueryBookmarkWindow {
+	return cloneBookmarkWindows(b.data.Windows)
+}
+
+// OpenWindow opens one saved window at its bookmarked fixed version.
+func (b *QueryBookmark) OpenWindow(index int) (*QueryView, error) {
+	if b == nil || index < 0 || index >= len(b.data.Windows) {
+		return nil, ErrInvalidQueryBookmark
+	}
+	window := b.data.Windows[index]
+	b.store.mu.Lock()
+	defer b.store.mu.Unlock()
+	return b.store.openQueryViewDataLocked(queryViewData{
+		Name:    b.data.Name,
+		Series:  window.Series,
+		Start:   window.Start,
+		End:     window.End,
+		Version: window.Version,
+		Tiers:   append([]ViewTier(nil), window.Tiers...),
+	})
+}
+
 // OpenQueryView opens a saved view at its original fixed version. Stored
 // aggregate evidence is readable without registering the callback again; the
 // callback is only needed when future Downsample calls compute new buckets.
@@ -236,12 +536,16 @@ func (s *Store) OpenQueryView(name string) (*QueryView, error) {
 		s.mu.Unlock()
 		return nil, ErrQueryViewNotFound
 	}
+	view, err := s.openQueryViewDataLocked(data)
+	s.mu.Unlock()
+	return view, err
+}
+
+func (s *Store) openQueryViewDataLocked(data queryViewData) (*QueryView, error) {
 	if err := s.validateSavedTiersLocked(data.Start, data.End, data.Tiers); err != nil {
-		s.mu.Unlock()
 		return nil, err
 	}
 	snap := s.snapshotAtLocked(data.Version)
-	s.mu.Unlock()
 	return &QueryView{store: s, snap: snap, data: data}, nil
 }
 
@@ -551,6 +855,10 @@ func (s *Store) DiffQueryViews(fromName, toName string) ([]ChangeRange, error) {
 		return nil, err
 	}
 	defer to.Close()
+	return compareQueryViews(from, to)
+}
+
+func compareQueryViews(from, to *QueryView) ([]ChangeRange, error) {
 	if from.data.Series != to.data.Series || from.data.Start != to.data.Start || from.data.End != to.data.End || len(from.data.Tiers) != len(to.data.Tiers) {
 		return nil, ErrQueryViewMismatch
 	}

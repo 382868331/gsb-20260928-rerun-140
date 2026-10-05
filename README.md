@@ -17,6 +17,7 @@
 - `ReadPage`：按游标分页浏览，连续原始缺失点折叠成一个条目；观察、真实零值、空聚合桶和未物化汇总保持不同状态。条目包含粒度、聚合器、样本量、来源版本和折叠桶数，同一视图所有页都固定在创建时版本。
 - `ReadWindow`：按需展开变化区间或任意半开时间窗口，返回该窗口内的具体桶和样本信息。
 - `OpenQueryView` / `CancelQueryView`：保存重开后仍按创建时版本读取；取消前，压缩会保留该视图需要的历史版本，取消并关闭在途读取、再次压缩后释放。`DiffQueryViews` 先返回新旧视图之间具体变化的桶时间范围，跨粒度边界不合并，随后可对每个区间调用 `ReadWindow`。
+- `CreateQueryBookmark` / `OpenQueryBookmark` / `CancelQueryBookmark`：将多个时间窗口作为具名书签持久化，重开后恢复每个窗口的位置、粒度和固定版本。`DiffQueryBookmarks` 按对应位置比较窗口，并把发生变化的窗口排在前面；取消书签只移除该书签的保留引用，不影响独立视图或其他书签。
 
 ## 示例
 
@@ -51,6 +52,9 @@ if page.HasMore {
 }
 window, err := view.ReadWindow(1700000000, 1700007200)
 changes, err := store.DiffQueryViews("yesterday", "today")
+bookmark, err := store.CreateQueryBookmark("incident", []string{"daily-detail"})
+_ = bookmark
+comparisons, err := store.DiffQueryBookmarks("before", "after")
 ```
 
 ## 验证

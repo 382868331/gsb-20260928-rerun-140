@@ -305,6 +305,179 @@ func TestCancelQueryViewReleasesCompactionHistory(t *testing.T) {
 	}
 }
 
+func TestQueryBookmarkRestoresWindowsAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir, &Options{DisableSync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerTestAverage(t, store)
+	appendAt(t, store, 0, 10)
+	appendAt(t, store, 10, 20)
+	if _, err := store.Downsample("avg", "cpu", 0, 20); err != nil {
+		t.Fatal(err)
+	}
+	old, err := store.SaveQueryBookmark("old", []QueryBookmarkWindow{{
+		Series: "cpu",
+		Start:  0,
+		End:    20,
+		Tiers:  []ViewTier{{Start: 0, End: 10, Width: 1}, {Start: 10, End: 20, Width: 10, Aggregator: "avg"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := old.Windows()[0].Version; got != 4 {
+		t.Fatalf("bookmarked version = %d, want 4", got)
+	}
+
+	if _, err := store.Revise(Observation{Series: "cpu", Timestamp: 0, Data: []byte{40}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append(Observation{Series: "cpu", Timestamp: 15, Data: []byte{30}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Downsample("avg", "cpu", 0, 20); err != nil {
+		t.Fatal(err)
+	}
+	newBookmark, err := store.SaveQueryBookmark("new", []QueryBookmarkWindow{{
+		Series:  "cpu",
+		Start:   0,
+		End:     20,
+		Version: store.Version(),
+		Tiers:   []ViewTier{{Start: 0, End: 10, Width: 1}, {Start: 10, End: 20, Width: 10, Aggregator: "avg"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := newBookmark.Windows()[0].Version; got != 8 {
+		t.Fatalf("bookmarked version = %d, want 8", got)
+	}
+
+	store = reopenStore(t, store)
+	opened, err := store.OpenQueryBookmark("old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	windows := opened.Windows()
+	if len(windows) != 1 || windows[0].Start != 0 || windows[0].End != 20 || windows[0].Version != 4 ||
+		len(windows[0].Tiers) != 2 || windows[0].Tiers[1].Aggregator != "avg" {
+		t.Fatalf("restored windows = %+v", windows)
+	}
+	view, err := opened.OpenWindow(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := view.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Version != 4 || result.Segments[0].Buckets[0].Value[0] != 10 ||
+		result.Segments[1].Buckets[0].SampleCount != 1 || result.Segments[1].Buckets[0].Value[0] != 20 {
+		t.Fatalf("old bookmark window changed: %+v", result)
+	}
+	view.Close()
+}
+
+func TestDiffQueryBookmarksPrioritizesChangedWindows(t *testing.T) {
+	store := openTestStore(t)
+	tiers := func() []ViewTier {
+		return []ViewTier{{Start: 0, End: 10, Width: 1}, {Start: 10, End: 20, Width: 10, Aggregator: "avg"}}
+	}
+	registerTestAverage(t, store)
+	appendAt(t, store, 0, 1)
+	appendAt(t, store, 10, 1)
+	if _, err := store.Downsample("avg", "cpu", 0, 20); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SaveQueryBookmark("before", []QueryBookmarkWindow{
+		{Series: "cpu", Start: 0, End: 10, Tiers: tiers()[:1]},
+		{Series: "cpu", Start: 10, End: 20, Tiers: []ViewTier{{Start: 10, End: 20, Width: 10, Aggregator: "avg"}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	appendAt(t, store, 5, 2)
+	if _, err := store.Downsample("avg", "cpu", 0, 20); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SaveQueryBookmark("after", []QueryBookmarkWindow{
+		{Series: "cpu", Start: 0, End: 10, Tiers: tiers()[:1]},
+		{Series: "cpu", Start: 10, End: 20, Tiers: []ViewTier{{Start: 10, End: 20, Width: 10, Aggregator: "avg"}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	comparisons, err := store.DiffQueryBookmarks("before", "after")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(comparisons) != 2 || !comparisons[0].Changed || comparisons[0].Index != 0 ||
+		len(comparisons[0].Changes) != 1 || comparisons[0].Changes[0] != (ChangeRange{Start: 5, End: 6}) ||
+		comparisons[1].Changed || comparisons[1].Index != 1 || len(comparisons[1].Changes) != 0 {
+		t.Fatalf("comparisons = %+v", comparisons)
+	}
+}
+
+func TestCancelQueryBookmarkKeepsOtherViewsAndBookmarks(t *testing.T) {
+	store := openTestStore(t)
+	registerTestAverage(t, store)
+	appendAt(t, store, 0, 1)
+	if _, err := store.Downsample("avg", "cpu", 0, 10); err != nil {
+		t.Fatal(err)
+	}
+	standalone, err := store.CreateQueryView("standalone", "cpu", 0, 10, []ViewTier{{Start: 0, End: 10, Width: 10, Aggregator: "avg"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	standalone.Close()
+	keep, err := store.SaveQueryBookmark("keep", []QueryBookmarkWindow{{Series: "cpu", Start: 0, End: 10, Tiers: []ViewTier{{Start: 0, End: 10, Width: 10, Aggregator: "avg"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := keep.Windows()[0].Version; got != 2 {
+		t.Fatalf("version = %d", got)
+	}
+	drop, err := store.CreateQueryBookmark("drop", []string{"standalone"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := drop.Windows()[0].Version; got != 2 {
+		t.Fatalf("version = %d", got)
+	}
+	if _, err := store.Revise(Observation{Series: "cpu", Timestamp: 0, Data: []byte{9}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Downsample("avg", "cpu", 0, 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CancelQueryBookmark("drop"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CancelQueryView("standalone"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.OpenQueryView("standalone"); err != ErrQueryViewNotFound {
+		t.Fatalf("canceled source view error = %v", err)
+	}
+	kept, err := store.OpenQueryBookmark("keep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	window, err := kept.OpenWindow(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result, err := window.Read(); err != nil || result.Version != 2 || result.Segments[0].Buckets[0].Value[0] != 1 {
+		t.Fatalf("kept bookmark = %+v, %v", result, err)
+	}
+	window.Close()
+	if _, err := store.OpenQueryBookmark("drop"); err != ErrQueryBookmarkNotFound {
+		t.Fatalf("canceled bookmark error = %v", err)
+	}
+}
+
 func registerTestAverage(t *testing.T, store *Store) {
 	t.Helper()
 	if err := store.RegisterAggregator("avg", 10, averageBytes); err != nil {

@@ -79,9 +79,17 @@ func (s *Store) Compact() (uint64, error) {
 
 func (s *Store) minQueryViewVersionLocked() uint64 {
 	var minimum uint64
+	consider := func(version uint64) {
+		if minimum == 0 || version < minimum {
+			minimum = version
+		}
+	}
 	for _, view := range s.queryViews {
-		if minimum == 0 || view.Version < minimum {
-			minimum = view.Version
+		consider(view.Version)
+	}
+	for _, bookmark := range s.queryBookmarks {
+		for _, window := range bookmark.Windows {
+			consider(window.Version)
 		}
 	}
 	return minimum

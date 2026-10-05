@@ -80,19 +80,20 @@ func visibleAt(records []Record, version uint64) (Record, bool) {
 // Store is an embedded, durable time-series store. Its zero value is not
 // usable; open it with Open.
 type Store struct {
-	mu          sync.Mutex
-	path        string
-	state       *immutableState
-	wal         *walFile
-	segments    []segmentMeta
-	nextSeg     uint64
-	pending     []Record
-	refs        *snapshotRefs
-	deleting    bool
-	waiters     []chan struct{}
-	compactHook func(stage string)
-	aggregators map[string]registeredAggregator
-	queryViews  map[string]queryViewData
+	mu             sync.Mutex
+	path           string
+	state          *immutableState
+	wal            *walFile
+	segments       []segmentMeta
+	nextSeg        uint64
+	pending        []Record
+	refs           *snapshotRefs
+	deleting       bool
+	waiters        []chan struct{}
+	compactHook    func(stage string)
+	aggregators    map[string]registeredAggregator
+	queryViews     map[string]queryViewData
+	queryBookmarks map[string]queryBookmarkData
 }
 
 type Options struct {
@@ -174,16 +175,25 @@ func Open(dir string, opts *Options) (*Store, error) {
 	for _, view := range persistentViews {
 		queryViews[view.Name] = view
 	}
+	persistentBookmarks, err := readQueryBookmarksFile(dir)
+	if err != nil {
+		return nil, err
+	}
+	queryBookmarks := make(map[string]queryBookmarkData, len(persistentBookmarks))
+	for _, bookmark := range persistentBookmarks {
+		queryBookmarks[bookmark.Name] = bookmark
+	}
 	return &Store{
-		path:        dir,
-		state:       state,
-		wal:         wal,
-		segments:    manifest.Segments,
-		nextSeg:     nextSegment,
-		pending:     append([]Record(nil), walRecords...),
-		refs:        newSnapshotRefs(),
-		aggregators: make(map[string]registeredAggregator),
-		queryViews:  queryViews,
+		path:           dir,
+		state:          state,
+		wal:            wal,
+		segments:       manifest.Segments,
+		nextSeg:        nextSegment,
+		pending:        append([]Record(nil), walRecords...),
+		refs:           newSnapshotRefs(),
+		aggregators:    make(map[string]registeredAggregator),
+		queryViews:     queryViews,
+		queryBookmarks: queryBookmarks,
 	}, nil
 }
 
