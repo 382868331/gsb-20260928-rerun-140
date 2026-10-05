@@ -84,6 +84,13 @@ func (s *Store) minQueryViewVersionLocked() uint64 {
 			minimum = view.Version
 		}
 	}
+	for _, bookmark := range s.bookmarks {
+		for _, window := range bookmark.Windows {
+			if minimum == 0 || window.Version < minimum {
+				minimum = window.Version
+			}
+		}
+	}
 	return minimum
 }
 

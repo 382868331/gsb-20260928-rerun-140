@@ -17,6 +17,7 @@
 - `ReadPage`：按游标分页浏览，连续原始缺失点折叠成一个条目；观察、真实零值、空聚合桶和未物化汇总保持不同状态。条目包含粒度、聚合器、样本量、来源版本和折叠桶数，同一视图所有页都固定在创建时版本。
 - `ReadWindow`：按需展开变化区间或任意半开时间窗口，返回该窗口内的具体桶和样本信息。
 - `OpenQueryView` / `CancelQueryView`：保存重开后仍按创建时版本读取；取消前，压缩会保留该视图需要的历史版本，取消并关闭在途读取、再次压缩后释放。`DiffQueryViews` 先返回新旧视图之间具体变化的桶时间范围，跨粒度边界不合并，随后可对每个区间调用 `ReadWindow`。
+- `CreateBookmark` / `OpenBookmark` / `CancelBookmark`：在查询视图上保存可命名的多窗口比较书签。每个窗口记录位置、粒度（原始点或聚合桶）和创建时固定的版本，重开后按原版本恢复；`ReadWindow` 展开单个窗口，`DiffBookmarks` 逐窗口比较两个书签并把发生变化的窗口排在前面，附具体变化时间范围。取消书签只释放该书签自己的版本引用，其他书签和查询视图的历史版本仍被保留。
 
 ## 示例
 
@@ -51,6 +52,13 @@ if page.HasMore {
 }
 window, err := view.ReadWindow(1700000000, 1700007200)
 changes, err := store.DiffQueryViews("yesterday", "today")
+
+bookmark, err := store.CreateBookmark("release-check", []timeseries.BookmarkWindow{
+	{View: "daily-detail", Start: 1700000000, End: 1700003600, Width: 1},
+	{View: "daily-detail", Start: 1700003600, End: 1700007200, Width: 60, Aggregator: "sum"},
+})
+window, err := bookmark.ReadWindow(0)
+diff, err := store.DiffBookmarks("release-check", "release-check-next")
 ```
 
 ## 验证

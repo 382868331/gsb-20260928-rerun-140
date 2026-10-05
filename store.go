@@ -93,6 +93,7 @@ type Store struct {
 	compactHook func(stage string)
 	aggregators map[string]registeredAggregator
 	queryViews  map[string]queryViewData
+	bookmarks   map[string]bookmarkData
 }
 
 type Options struct {
@@ -174,6 +175,14 @@ func Open(dir string, opts *Options) (*Store, error) {
 	for _, view := range persistentViews {
 		queryViews[view.Name] = view
 	}
+	persistentBookmarks, err := readBookmarksFile(dir)
+	if err != nil {
+		return nil, err
+	}
+	bookmarks := make(map[string]bookmarkData, len(persistentBookmarks))
+	for _, bookmark := range persistentBookmarks {
+		bookmarks[bookmark.Name] = bookmark
+	}
 	return &Store{
 		path:        dir,
 		state:       state,
@@ -184,6 +193,7 @@ func Open(dir string, opts *Options) (*Store, error) {
 		refs:        newSnapshotRefs(),
 		aggregators: make(map[string]registeredAggregator),
 		queryViews:  queryViews,
+		bookmarks:   bookmarks,
 	}, nil
 }
 
